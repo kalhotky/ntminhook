@@ -28,7 +28,6 @@
 
 #include <phnt/phnt_windows.h>
 #include <phnt/phnt.h>
-#include <tlhelp32.h>
 #include <limits.h>
 
 #include <ntminhook/minhook.h>
@@ -121,14 +120,14 @@ static PHOOK_ENTRY AddHookEntry()
     if (g_hooks.pItems == NULL)
     {
         g_hooks.capacity = INITIAL_HOOK_CAPACITY;
-        g_hooks.pItems = (PHOOK_ENTRY)HeapAlloc(
+        g_hooks.pItems = (PHOOK_ENTRY)RtlAllocateHeap(
             g_hHeap, 0, g_hooks.capacity * sizeof(HOOK_ENTRY));
         if (g_hooks.pItems == NULL)
             return NULL;
     }
     else if (g_hooks.size >= g_hooks.capacity)
     {
-        PHOOK_ENTRY p = (PHOOK_ENTRY)HeapReAlloc(
+        PHOOK_ENTRY p = (PHOOK_ENTRY)RtlReAllocateHeap(
             g_hHeap, 0, g_hooks.pItems, (g_hooks.capacity * 2) * sizeof(HOOK_ENTRY));
         if (p == NULL)
             return NULL;
@@ -150,7 +149,7 @@ static VOID DeleteHookEntry(UINT pos)
 
     if (g_hooks.capacity / 2 >= INITIAL_HOOK_CAPACITY && g_hooks.capacity / 2 >= g_hooks.size)
     {
-        PHOOK_ENTRY p = (PHOOK_ENTRY)HeapReAlloc(
+        PHOOK_ENTRY p = (PHOOK_ENTRY)RtlReAllocateHeap(
             g_hHeap, 0, g_hooks.pItems, (g_hooks.capacity / 2) * sizeof(HOOK_ENTRY));
         if (p == NULL)
             return;
@@ -211,7 +210,7 @@ static VOID ProcessThreadIPs(HANDLE hThread, UINT pos, UINT action)
     UINT count;
 
     c.ContextFlags = CONTEXT_CONTROL;
-    if (!GetThreadContext(hThread, &c))
+    if (!NT_SUCCESS(NtGetContextThread(hThread, &c)))
         return;
 
     if (pos == ALL_HOOKS_POS)
@@ -255,7 +254,7 @@ static VOID ProcessThreadIPs(HANDLE hThread, UINT pos, UINT action)
         if (ip != 0)
         {
             *pIP = ip;
-            SetThreadContext(hThread, &c);
+            NtSetContextThread(hThread, &c);
         }
     }
 }
@@ -263,66 +262,83 @@ static VOID ProcessThreadIPs(HANDLE hThread, UINT pos, UINT action)
 //-------------------------------------------------------------------------
 static BOOL EnumerateThreads(PFROZEN_THREADS pThreads)
 {
-    BOOL succeeded = FALSE;
+    ULONG ReturnLength;
+    NTSTATUS Status = NtQuerySystemInformation(SystemProcessInformation, NULL, 0, &ReturnLength);
 
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnapshot != INVALID_HANDLE_VALUE)
+    if (Status != STATUS_INFO_LENGTH_MISMATCH)
     {
-        THREADENTRY32 te;
-        te.dwSize = sizeof(THREADENTRY32);
-        if (Thread32First(hSnapshot, &te))
+        return FALSE;
+    }
+
+    ReturnLength += sizeof(SYSTEM_PROCESS_INFORMATION) * 4; // To be safe
+    SYSTEM_PROCESS_INFORMATION* pSysProcInfoList = RtlAllocateHeap(g_hHeap, 0, ReturnLength);
+
+    if (!pSysProcInfoList)
+    {
+        return FALSE;
+    }
+
+    BOOL Succeeded = FALSE;
+
+    if (NT_SUCCESS(NtQuerySystemInformation(SystemProcessInformation, pSysProcInfoList, ReturnLength, NULL)))
+    {
+        Succeeded = TRUE;
+        SYSTEM_PROCESS_INFORMATION* pSysProcInfo = pSysProcInfoList;
+
+        while (pSysProcInfo)
         {
-            succeeded = TRUE;
-            do
+            for (ULONG i = 0; i < pSysProcInfo->NumberOfThreads; i += 1)
             {
-                if (te.dwSize >= (FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(DWORD))
-                    && te.th32OwnerProcessID == GetCurrentProcessId()
-                    && te.th32ThreadID != GetCurrentThreadId())
+                SYSTEM_THREAD_INFORMATION* pSysThreadInfo = &pSysProcInfo->Threads[i];
+
+                if (pSysThreadInfo->ClientId.UniqueProcess == NtCurrentProcessId() && pSysThreadInfo->ClientId.UniqueThread != NtCurrentThreadId())
                 {
                     if (pThreads->pItems == NULL)
                     {
                         pThreads->capacity = INITIAL_THREAD_CAPACITY;
-                        pThreads->pItems
-                            = (LPDWORD)HeapAlloc(g_hHeap, 0, pThreads->capacity * sizeof(DWORD));
+                        pThreads->pItems = (LPDWORD)RtlAllocateHeap(g_hHeap, 0, pThreads->capacity * sizeof(DWORD));
+
                         if (pThreads->pItems == NULL)
                         {
-                            succeeded = FALSE;
+                            Succeeded = FALSE;
                             break;
                         }
                     }
                     else if (pThreads->size >= pThreads->capacity)
                     {
-                        LPDWORD p;
                         pThreads->capacity *= 2;
-                        p = (LPDWORD)HeapReAlloc(
-                            g_hHeap, 0, pThreads->pItems, pThreads->capacity * sizeof(DWORD));
+                        LPDWORD p = (LPDWORD)RtlReAllocateHeap(g_hHeap, 0, pThreads->pItems, pThreads->capacity * sizeof(DWORD));
+
                         if (p == NULL)
                         {
-                            succeeded = FALSE;
+                            Succeeded = FALSE;
                             break;
                         }
 
                         pThreads->pItems = p;
                     }
-                    pThreads->pItems[pThreads->size++] = te.th32ThreadID;
+
+                    pThreads->pItems[pThreads->size++] = (DWORD)pSysThreadInfo->ClientId.UniqueThread;
                 }
-
-                te.dwSize = sizeof(THREADENTRY32);
-            } while (Thread32Next(hSnapshot, &te));
-
-            if (succeeded && GetLastError() != ERROR_NO_MORE_FILES)
-                succeeded = FALSE;
-
-            if (!succeeded && pThreads->pItems != NULL)
-            {
-                HeapFree(g_hHeap, 0, pThreads->pItems);
-                pThreads->pItems = NULL;
             }
+
+            if (pSysProcInfo->NextEntryOffset == 0)
+            {
+                break;
+            }
+
+            pSysProcInfo = (SYSTEM_PROCESS_INFORMATION*)((BYTE*)pSysProcInfo + pSysProcInfo->NextEntryOffset);
         }
-        CloseHandle(hSnapshot);
+
+        if (!Succeeded && pThreads->pItems != NULL)
+        {
+            RtlFreeHeap(g_hHeap, 0, pThreads->pItems);
+            pThreads->pItems = NULL;
+        }
     }
 
-    return succeeded;
+    RtlFreeHeap(g_hHeap, 0, pSysProcInfoList);
+    return Succeeded;
 }
 
 //-------------------------------------------------------------------------
@@ -342,17 +358,30 @@ static MH_STATUS Freeze(PFROZEN_THREADS pThreads, UINT pos, UINT action)
         UINT i;
         for (i = 0; i < pThreads->size; ++i)
         {
-            HANDLE hThread = OpenThread(THREAD_ACCESS, FALSE, pThreads->pItems[i]);
+            HANDLE hThread;
+            OBJECT_ATTRIBUTES ObjectAttrib = {
+                .Length = sizeof(ObjectAttrib)
+            };
+            CLIENT_ID ClientId = {
+                .UniqueThread = (HANDLE)pThreads->pItems[i]
+            };
+
+            if (!NT_SUCCESS(NtOpenThread(&hThread, THREAD_ACCESS, &ObjectAttrib, &ClientId)))
+                hThread = NULL;
+
             BOOL suspended = FALSE;
             if (hThread != NULL)
             {
-                DWORD result = SuspendThread(hThread);
+                ULONG result;
+                if (!NT_SUCCESS(NtSuspendThread(hThread, &result)))
+                    result = 0xFFFFFFFF;
+
                 if (result != 0xFFFFFFFF)
                 {
                     suspended = TRUE;
                     ProcessThreadIPs(hThread, pos, action);
                 }
-                CloseHandle(hThread);
+                NtClose(hThread);
             }
 
             if (!suspended)
@@ -377,16 +406,26 @@ static VOID Unfreeze(PFROZEN_THREADS pThreads)
             DWORD threadId = pThreads->pItems[i];
             if (threadId != 0)
             {
-                HANDLE hThread = OpenThread(THREAD_ACCESS, FALSE, threadId);
+                HANDLE hThread;
+                OBJECT_ATTRIBUTES ObjectAttrib = {
+                    .Length = sizeof(ObjectAttrib)
+                };
+                CLIENT_ID ClientId = {
+                    .UniqueThread = (HANDLE)threadId
+                };
+
+                if (!NT_SUCCESS(NtOpenThread(&hThread, THREAD_ACCESS, &ObjectAttrib, &ClientId)))
+                    hThread = NULL;
+
                 if (hThread != NULL)
                 {
-                    ResumeThread(hThread);
-                    CloseHandle(hThread);
+                    NtResumeThread(hThread, NULL);
+                    NtClose(hThread);
                 }
             }
         }
 
-        HeapFree(g_hHeap, 0, pThreads->pItems);
+        RtlFreeHeap(g_hHeap, 0, pThreads->pItems);
     }
 }
 
@@ -404,7 +443,9 @@ static MH_STATUS EnableHookLL(UINT pos, BOOL enable)
         patchSize    += sizeof(JMP_REL_SHORT);
     }
 
-    if (!VirtualProtect(pPatchTarget, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect))
+    PVOID pProtect = pPatchTarget;
+    SIZE_T ProtectSize = patchSize;
+    if (!NT_SUCCESS(NtProtectVirtualMemory(NtCurrentProcess(), &pProtect, &ProtectSize, PAGE_EXECUTE_READWRITE, &oldProtect)))
         return MH_ERROR_MEMORY_PROTECT;
 
     if (enable)
@@ -428,10 +469,12 @@ static MH_STATUS EnableHookLL(UINT pos, BOOL enable)
             memcpy(pPatchTarget, pHook->backup, sizeof(JMP_REL));
     }
 
-    VirtualProtect(pPatchTarget, patchSize, oldProtect, &oldProtect);
+    pProtect = pPatchTarget;
+    ProtectSize = patchSize;
+    NtProtectVirtualMemory(NtCurrentProcess(), &pProtect, &ProtectSize, oldProtect, &oldProtect);
 
     // Just-in-case measure.
-    FlushInstructionCache(GetCurrentProcess(), pPatchTarget, patchSize);
+    NtFlushInstructionCache(NtCurrentProcess(), pPatchTarget, patchSize);
 
     pHook->isEnabled   = enable;
     pHook->queueEnable = enable;
@@ -488,12 +531,15 @@ static VOID EnterSpinLock(VOID)
         // No need to generate a memory barrier here, since InterlockedCompareExchange()
         // generates a full memory barrier itself.
 
+        LARGE_INTEGER DelayInterval;
+
         // Prevent the loop from being too busy.
         if (spinCount < 32)
-            Sleep(0);
+            DelayInterval.QuadPart = 0;
         else
-            Sleep(1);
+            DelayInterval.QuadPart = -10000;
 
+        NtDelayExecution(FALSE, &DelayInterval);
         spinCount++;
     }
 }
@@ -516,7 +562,7 @@ MH_STATUS WINAPI MH_Initialize(VOID)
 
     if (g_hHeap == NULL)
     {
-        g_hHeap = HeapCreate(0, 0, 0);
+        g_hHeap = (HANDLE)RtlCreateHeap(HEAP_CLASS_1 | HEAP_NO_SERIALIZE | HEAP_GROWABLE, NULL, 0, 0, NULL, NULL);
         if (g_hHeap != NULL)
         {
             // Initialize the internal function buffer.
@@ -556,8 +602,8 @@ MH_STATUS WINAPI MH_Uninitialize(VOID)
 
             UninitializeBuffer();
 
-            HeapFree(g_hHeap, 0, g_hooks.pItems);
-            HeapDestroy(g_hHeap);
+            RtlFreeHeap(g_hHeap, 0, g_hooks.pItems);
+            RtlDestroyHeap(g_hHeap);
 
             g_hHeap = NULL;
 
@@ -886,14 +932,57 @@ MH_STATUS WINAPI MH_CreateHookApiEx(
     LPCWSTR pszModule, LPCSTR pszProcName, LPVOID pDetour,
     LPVOID *ppOriginal, LPVOID *ppTarget)
 {
-    HMODULE hModule;
-    LPVOID  pTarget;
+    HMODULE hModule = NULL;
+    LPVOID  pTarget = NULL;
 
-    hModule = GetModuleHandleW(pszModule);
+    LIST_ENTRY* pListHead = &NtCurrentPeb()->Ldr->InLoadOrderModuleList;
+
+    for (LIST_ENTRY* pList = pListHead->Flink; pList && pList != pListHead; pList = pList->Flink)
+    {
+        LDR_DATA_TABLE_ENTRY* pEntry = CONTAINING_RECORD(pList, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+        if (pEntry->BaseDllName.Buffer && !_wcsicmp(pszModule, pEntry->BaseDllName.Buffer))
+        {
+            hModule = (HMODULE)pEntry->DllBase;
+            break;
+        }
+    }
+
     if (hModule == NULL)
         return MH_ERROR_MODULE_NOT_FOUND;
 
-    pTarget = (LPVOID)GetProcAddress(hModule, pszProcName);
+    IMAGE_NT_HEADERS* pNtHeaders = RtlImageNtHeader(hModule);
+
+    if (pNtHeaders && pNtHeaders->OptionalHeader.NumberOfRvaAndSizes >= 1)
+    {
+        IMAGE_DATA_DIRECTORY* pExportEntry = &pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+
+        if (pExportEntry->VirtualAddress && pExportEntry->Size)
+        {
+            BYTE* pDllBase = (BYTE*)hModule;
+            IMAGE_EXPORT_DIRECTORY* pExportDirectory = (IMAGE_EXPORT_DIRECTORY*)(pDllBase + pExportEntry->VirtualAddress);
+
+            if (pExportDirectory->NumberOfNames >= 1)
+            {
+                DWORD* pNameTable = (DWORD*)(pDllBase + pExportDirectory->AddressOfNames);
+                WORD* pNameOrdinalTable = (WORD*)(pDllBase + pExportDirectory->AddressOfNameOrdinals);
+                DWORD* pFunctionTable = (DWORD*)(pDllBase + pExportDirectory->AddressOfFunctions);
+
+                for (DWORD i = 0; i < pExportDirectory->NumberOfNames; i += 1)
+                {
+                    CHAR* pExportName = (CHAR*)(pDllBase + pNameTable[i]);
+
+                    if (pExportName && !strcmp(pszProcName, pExportName))
+                    {
+                        WORD NameOrdinal = (WORD)(pDllBase + pNameOrdinalTable[i]);
+                        pTarget = (LPVOID)(pDllBase + pFunctionTable[NameOrdinal]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     if (pTarget == NULL)
         return MH_ERROR_FUNCTION_NOT_FOUND;
 

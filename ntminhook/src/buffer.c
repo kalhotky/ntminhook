@@ -80,7 +80,8 @@ VOID UninitializeBuffer(VOID)
     while (pBlock)
     {
         PMEMORY_BLOCK pNext = pBlock->pNext;
-        VirtualFree(pBlock, 0, MEM_RELEASE);
+        SIZE_T RegionSize = 0;
+        NtFreeVirtualMemory(NtCurrentProcess(), &pBlock, &RegionSize, MEM_RELEASE);
         pBlock = pNext;
     }
 }
@@ -100,7 +101,7 @@ static LPVOID FindPrevFreeRegion(LPVOID pAddress, LPVOID pMinAddr, DWORD dwAlloc
     while (tryAddr >= (ULONG_PTR)pMinAddr)
     {
         MEMORY_BASIC_INFORMATION mbi;
-        if (VirtualQuery((LPVOID)tryAddr, &mbi, sizeof(mbi)) == 0)
+        if (!NT_SUCCESS(NtQueryVirtualMemory(NtCurrentProcess(), (PVOID)tryAddr, MemoryBasicInformation, &mbi, sizeof(mbi), NULL)))
             break;
 
         if (mbi.State == MEM_FREE)
@@ -131,7 +132,7 @@ static LPVOID FindNextFreeRegion(LPVOID pAddress, LPVOID pMaxAddr, DWORD dwAlloc
     while (tryAddr <= (ULONG_PTR)pMaxAddr)
     {
         MEMORY_BASIC_INFORMATION mbi;
-        if (VirtualQuery((LPVOID)tryAddr, &mbi, sizeof(mbi)) == 0)
+        if (!NT_SUCCESS(NtQueryVirtualMemory(NtCurrentProcess(), (PVOID)tryAddr, MemoryBasicInformation, &mbi, sizeof(mbi), NULL)))
             break;
 
         if (mbi.State == MEM_FREE)
@@ -156,10 +157,10 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
     ULONG_PTR minAddr;
     ULONG_PTR maxAddr;
 
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    minAddr = (ULONG_PTR)si.lpMinimumApplicationAddress;
-    maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
+    SYSTEM_BASIC_INFORMATION si;
+    NtQuerySystemInformation(SystemBasicInformation, &si, sizeof(si), NULL);
+    minAddr = si.MinimumUserModeAddress;
+    maxAddr = si.MaximumUserModeAddress;
 
     // pOrigin ± 512MB
     if ((ULONG_PTR)pOrigin > MAX_MEMORY_RANGE && minAddr < (ULONG_PTR)pOrigin - MAX_MEMORY_RANGE)
@@ -191,12 +192,15 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
         LPVOID pAlloc = pOrigin;
         while ((ULONG_PTR)pAlloc >= minAddr)
         {
-            pAlloc = FindPrevFreeRegion(pAlloc, (LPVOID)minAddr, si.dwAllocationGranularity);
+            pAlloc = FindPrevFreeRegion(pAlloc, (LPVOID)minAddr, si.AllocationGranularity);
             if (pAlloc == NULL)
                 break;
 
-            pBlock = (PMEMORY_BLOCK)VirtualAlloc(
-                pAlloc, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            pBlock = pAlloc;
+            SIZE_T RegionSize = MEMORY_BLOCK_SIZE;
+            if (!NT_SUCCESS(NtAllocateVirtualMemory(NtCurrentProcess(), &pBlock, 0, &RegionSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
+                pBlock = NULL;
+
             if (pBlock != NULL)
                 break;
         }
@@ -208,20 +212,25 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
         LPVOID pAlloc = pOrigin;
         while ((ULONG_PTR)pAlloc <= maxAddr)
         {
-            pAlloc = FindNextFreeRegion(pAlloc, (LPVOID)maxAddr, si.dwAllocationGranularity);
+            pAlloc = FindNextFreeRegion(pAlloc, (LPVOID)maxAddr, si.AllocationGranularity);
             if (pAlloc == NULL)
                 break;
 
-            pBlock = (PMEMORY_BLOCK)VirtualAlloc(
-                pAlloc, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            pBlock = pAlloc;
+            SIZE_T RegionSize = MEMORY_BLOCK_SIZE;
+            if (!NT_SUCCESS(NtAllocateVirtualMemory(NtCurrentProcess(), &pBlock, 0, &RegionSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
+                pBlock = NULL;
+
             if (pBlock != NULL)
                 break;
         }
     }
 #else
     // In x86 mode, a memory block can be placed anywhere.
-    pBlock = (PMEMORY_BLOCK)VirtualAlloc(
-        NULL, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    pBlock = NULL;
+    SIZE_T RegionSize = MEMORY_BLOCK_SIZE;
+    if (!NT_SUCCESS(NtAllocateVirtualMemory(NtCurrentProcess(), &pBlock, 0, &RegionSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
+        pBlock = NULL;
 #endif
 
     if (pBlock != NULL)
@@ -292,7 +301,8 @@ VOID FreeBuffer(LPVOID pBuffer)
                 else
                     g_pMemoryBlocks = pBlock->pNext;
 
-                VirtualFree(pBlock, 0, MEM_RELEASE);
+                SIZE_T RegionSize = 0;
+                NtFreeVirtualMemory(NtCurrentProcess(), &pBlock, &RegionSize, MEM_RELEASE);
             }
 
             break;
@@ -307,7 +317,7 @@ VOID FreeBuffer(LPVOID pBuffer)
 BOOL IsExecutableAddress(LPVOID pAddress)
 {
     MEMORY_BASIC_INFORMATION mi;
-    VirtualQuery(pAddress, &mi, sizeof(mi));
+    NtQueryVirtualMemory(NtCurrentProcess(), (PVOID)pAddress, MemoryBasicInformation, &mi, sizeof(mi), NULL);
 
     return (mi.State == MEM_COMMIT && (mi.Protect & PAGE_EXECUTE_FLAGS));
 }
