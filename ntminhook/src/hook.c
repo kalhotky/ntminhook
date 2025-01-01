@@ -26,7 +26,8 @@
  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <windows.h>
+#include <phnt/phnt_windows.h>
+#include <phnt/phnt.h>
 #include <tlhelp32.h>
 #include <limits.h>
 

@@ -26,7 +26,8 @@
  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <windows.h>
+#include <phnt/phnt_windows.h>
+#include <phnt/phnt.h>
 #include "buffer.h"
 
 // Size of each memory block. (= page size of VirtualAlloc)
